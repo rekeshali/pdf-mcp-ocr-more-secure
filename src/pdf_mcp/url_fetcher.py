@@ -22,6 +22,8 @@ from urllib.parse import urlparse
 
 import httpx
 
+from .config import check_url_host_allowed
+
 # Maximum download size: 100 MB
 MAX_DOWNLOAD_SIZE = 100 * 1024 * 1024
 
@@ -143,6 +145,11 @@ class URLFetcher:
                     f"URL '{url}' host '{hostname}' resolves to {ip}, "
                     f"which is in a blocked range ({blocked}). SSRF floor."
                 )
+
+        # User URL-host allow/deny from ~/.claude/plugin-settings/pdf-mcp-ocr.json.
+        # Runs after the SSRF floor, so a user `*` allow cannot permit a blocked IP.
+        # Optional; absent config = permissive. Deny always wins.
+        check_url_host_allowed(hostname)
 
     def _get_cache_filename(self, url: str) -> str:
         """Generate cache filename from URL."""

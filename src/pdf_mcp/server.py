@@ -18,6 +18,7 @@ import pymupdf
 from fastmcp import FastMCP
 
 from .cache import PDFCache
+from .config import check_path_allowed
 from .extractor import (
     estimate_tokens,
     extract_images_from_page,
@@ -99,6 +100,11 @@ def _resolve_path(source: str) -> str:
 
     if not resolved.exists():
         raise FileNotFoundError(f"PDF file not found: {source}")
+
+    # Apply user path allow/deny rules from ~/.claude/plugin-settings/pdf-mcp-ocr.json.
+    # This layer is optional; if the config file is absent or has empty lists, all
+    # paths are permitted. Deny always wins. Documented in config.py.
+    check_path_allowed(str(resolved))
 
     return str(resolved)
 

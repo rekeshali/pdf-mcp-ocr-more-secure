@@ -135,6 +135,108 @@ def extract_text_from_page(page: Any, sort_by_position: bool = True) -> str:
         return str(page.get_text())
 
 
+def extract_text_with_ocr_fallback(
+    page: Any,
+    *,
+    ocr_language: str = "eng",
+    sparse_threshold: int = 50,
+    force_ocr: bool = False,
+    skip_ocr: bool = False,
+    sort_by_position: bool = True,
+    dpi: int = 300,
+) -> tuple[str, dict[str, Any]]:
+    """Extract page text, falling back to OCR when the embedded text layer is sparse.
+
+    Borrows the CMYK->RGB conversion, in-memory PIL handling, and per-page
+    warn-and-continue pattern from labeveryday/mcp_pdf_reader; diverges by
+    rendering the whole page at dpi (default 300) rather than iterating embedded
+    images — scanned PDFs typically encode one big embedded image per page, but
+    the page-render strategy also works when the scan is the rasterised
+    background behind invisible (empty) text objects.
+
+    Args:
+        page: PyMuPDF page object.
+        ocr_language: Tesseract lang code (e.g. "eng", "eng+fra"). Requires the
+            matching language pack installed on the Tesseract binary.
+        sparse_threshold: If the extracted text has fewer than this many
+            non-whitespace characters, OCR fallback fires. Set higher for PDFs
+            where even a small amount of real text is trustworthy.
+        force_ocr: Skip text-layer extraction; OCR the page directly.
+        skip_ocr: Never OCR, even if the text layer is empty. Returns whatever
+            get_text() produced.
+        sort_by_position: Passed to extract_text_from_page.
+        dpi: Rendering DPI for OCR. 300 is a reasonable default for scanned
+            documents; higher gives better accuracy at quadratic time cost.
+
+    Returns:
+        Tuple of (text, info) where info is:
+            {
+                "ocr_used": bool,
+                "ocr_confidence": "high" | "low" | None,
+                "ocr_error": str | None,
+            }
+        confidence is "high" if OCR produced >10 whitespace-separated tokens,
+        "low" otherwise (borrowed from labeveryday). None when OCR wasn't run.
+    """
+    info: dict[str, Any] = {
+        "ocr_used": False,
+        "ocr_confidence": None,
+        "ocr_error": None,
+    }
+
+    text = "" if force_ocr else extract_text_from_page(page, sort_by_position=sort_by_position)
+    stripped_len = len(text.strip())
+
+    should_ocr = force_ocr or (not skip_ocr and stripped_len < sparse_threshold)
+    if not should_ocr:
+        return text, info
+
+    try:
+        # Import lazily so the [ocr] extra is truly optional.
+        import pytesseract
+        from PIL import Image
+    except ImportError as exc:
+        info["ocr_error"] = (
+            f"OCR requested but dependencies missing: {exc}. "
+            f"Install with: pip install 'pdf-mcp-ocr-more-secure[ocr]' "
+            f"(also requires the tesseract system binary)."
+        )
+        logger.warning(info["ocr_error"])
+        if force_ocr:
+            raise RuntimeError(info["ocr_error"]) from exc
+        return text, info
+
+    try:
+        pix = page.get_pixmap(dpi=dpi)
+
+        # CMYK -> RGB before PNG encode (borrowed from labeveryday).
+        if pix.n - pix.alpha < 4:
+            img_bytes = pix.tobytes("png")
+        else:
+            img_bytes = pymupdf.Pixmap(pymupdf.csRGB, pix).tobytes("png")
+
+        from io import BytesIO
+
+        img = Image.open(BytesIO(img_bytes))
+        ocr_text = pytesseract.image_to_string(
+            img,
+            lang=ocr_language,
+            config="--psm 6",  # Uniform block of text — sensible default for whole-page scans
+        )
+
+        info["ocr_used"] = True
+        word_count = len(ocr_text.split())
+        info["ocr_confidence"] = "high" if word_count > 10 else "low"
+        return ocr_text, info
+
+    except Exception as exc:  # pragma: no cover — tesseract binary missing / render failure
+        info["ocr_error"] = f"OCR failed: {type(exc).__name__}: {exc}"
+        logger.warning(info["ocr_error"])
+        if force_ocr:
+            raise
+        return text, info
+
+
 def extract_text_with_coordinates(page: Any) -> list[dict[str, Any]]:
     """
     Extract text with Y-coordinate information for content ordering.

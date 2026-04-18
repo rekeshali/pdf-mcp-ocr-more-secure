@@ -340,85 +340,132 @@ class TestClearCache:
 
 
 class TestSSRFProtection:
-    """Tests for SSRF prevention in URL validation."""
+    """Tests for the hardened URL floor: https-only scheme + SSRF CIDR block list."""
 
-    def test_localhost_blocked(self, url_fetcher):
-        """URLs targeting localhost are blocked."""
-        for url in [
-            "https://localhost/secret.pdf",
-            "https://127.0.0.1/secret.pdf",
-            "https://0.0.0.0/secret.pdf",
-        ]:
-            with pytest.raises(ValueError, match="localhost"):
-                url_fetcher._validate_url(url)
+    # ── Scheme floor ────────────────────────────────────────────────────
 
-    def test_private_ip_blocked(self, url_fetcher):
-        """URLs targeting private IPs are blocked."""
-        with patch.object(URLFetcher, "_is_private_ip", return_value=True):
-            with pytest.raises(ValueError, match="private/reserved"):
-                url_fetcher._validate_url("https://internal-server.corp/secret.pdf")
+    def test_http_scheme_blocked(self, url_fetcher):
+        """http:// is rejected (the floor is https-only)."""
+        with pytest.raises(ValueError, match=r"[Oo]nly https://"):
+            url_fetcher._validate_url("http://example.com/test.pdf")
 
-    def test_no_hostname_blocked(self, url_fetcher):
-        """URL with no hostname raises ValueError."""
-        with pytest.raises(ValueError, match="Could not extract hostname"):
-            url_fetcher._validate_url("https://")
-
-    def test_non_http_scheme_blocked(self, url_fetcher):
-        """Non-HTTP(S) schemes are blocked."""
-        with pytest.raises(ValueError, match="Only HTTP and HTTPS"):
+    def test_ftp_scheme_blocked(self, url_fetcher):
+        """Non-HTTP schemes are rejected."""
+        with pytest.raises(ValueError, match=r"[Oo]nly https://"):
             url_fetcher._validate_url("ftp://example.com/test.pdf")
+
+    def test_file_scheme_blocked(self, url_fetcher):
+        """file:// is rejected."""
+        with pytest.raises(ValueError, match=r"[Oo]nly https://"):
+            url_fetcher._validate_url("file:///etc/passwd")
+
+    def test_data_scheme_blocked(self, url_fetcher):
+        """data: URIs are rejected."""
+        with pytest.raises(ValueError, match=r"[Oo]nly https://"):
+            url_fetcher._validate_url("data:application/pdf;base64,AAA")
+
+    # ── SSRF floor (DNS-resolved + CIDR check) ──────────────────────────
+
+    def test_loopback_ip_literal_blocked(self, url_fetcher):
+        """https://127.0.0.1 rejected without DNS lookup."""
+        with pytest.raises(ValueError, match="SSRF floor"):
+            url_fetcher._validate_url("https://127.0.0.1/test.pdf")
+
+    def test_localhost_hostname_blocked_via_dns(self, url_fetcher):
+        """localhost resolves to 127.0.0.1 → blocked."""
+        with patch(
+            "socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("127.0.0.1", 0))],
+        ):
+            with pytest.raises(ValueError, match="SSRF floor"):
+                url_fetcher._validate_url("https://localhost/test.pdf")
+
+    def test_cloud_metadata_endpoint_blocked(self, url_fetcher):
+        """169.254.169.254 (AWS/GCP metadata) is in the floor via link-local."""
+        with patch(
+            "socket.getaddrinfo",
+            return_value=[(2, 1, 6, "", ("169.254.169.254", 0))],
+        ):
+            with pytest.raises(ValueError, match="SSRF floor"):
+                url_fetcher._validate_url("https://metadata.internal/creds")
+
+    def test_rfc1918_ranges_blocked(self, url_fetcher):
+        """All three RFC 1918 private ranges rejected."""
+        for ip in ["10.0.0.1", "172.20.0.1", "192.168.1.1"]:
+            with patch(
+                "socket.getaddrinfo",
+                return_value=[(2, 1, 6, "", (ip, 0))],
+            ):
+                with pytest.raises(ValueError, match="SSRF floor"):
+                    url_fetcher._validate_url("https://intranet.corp/test.pdf")
+
+    def test_ipv6_loopback_blocked(self, url_fetcher):
+        """::1 blocked."""
+        with patch(
+            "socket.getaddrinfo",
+            return_value=[(10, 1, 6, "", ("::1", 0, 0, 0))],
+        ):
+            with pytest.raises(ValueError, match="SSRF floor"):
+                url_fetcher._validate_url("https://ipv6-lo/test.pdf")
+
+    def test_ipv6_link_local_blocked(self, url_fetcher):
+        """fe80::/10 blocked."""
+        with patch(
+            "socket.getaddrinfo",
+            return_value=[(10, 1, 6, "", ("fe80::1", 0, 0, 0))],
+        ):
+            with pytest.raises(ValueError, match="SSRF floor"):
+                url_fetcher._validate_url("https://ipv6-link/test.pdf")
+
+    def test_ipv6_unique_local_blocked(self, url_fetcher):
+        """fc00::/7 (ULA) blocked."""
+        with patch(
+            "socket.getaddrinfo",
+            return_value=[(10, 1, 6, "", ("fd12::1", 0, 0, 0))],
+        ):
+            with pytest.raises(ValueError, match="SSRF floor"):
+                url_fetcher._validate_url("https://ipv6-ula/test.pdf")
+
+    def test_multi_record_dns_any_blocked_rejects(self, url_fetcher):
+        """If ANY resolved IP is in the floor, validation fails."""
+        with patch(
+            "socket.getaddrinfo",
+            return_value=[
+                (2, 1, 6, "", ("93.184.216.34", 0)),  # public
+                (2, 1, 6, "", ("127.0.0.1", 0)),     # loopback
+            ],
+        ):
+            with pytest.raises(ValueError, match="SSRF floor"):
+                url_fetcher._validate_url("https://mixed.example/test.pdf")
+
+    # ── Passing cases ──────────────────────────────────────────────────
 
     def test_public_ip_allowed(self, url_fetcher):
         """Public IPs pass validation."""
-        with patch.object(URLFetcher, "_is_private_ip", return_value=False):
-            # Should not raise
-            url_fetcher._validate_url("https://public-server.com/test.pdf")
-
-    def test_is_private_ip_loopback(self):
-        """Loopback addresses are detected as private."""
         with patch(
             "socket.getaddrinfo",
-            return_value=[
-                (2, 1, 6, "", ("127.0.0.1", 0)),
-            ],
+            return_value=[(2, 1, 6, "", ("93.184.216.34", 0))],
         ):
-            assert URLFetcher._is_private_ip("localhost") is True
+            url_fetcher._validate_url("https://example.com/test.pdf")  # no raise
 
-    def test_is_private_ip_rfc1918(self):
-        """RFC 1918 private addresses are detected."""
-        for ip in ["10.0.0.1", "172.16.0.1", "192.168.1.1"]:
-            with patch(
-                "socket.getaddrinfo",
-                return_value=[
-                    (2, 1, 6, "", (ip, 0)),
-                ],
-            ):
-                assert URLFetcher._is_private_ip("some-host") is True
+    def test_public_ip_literal_skips_dns(self, url_fetcher):
+        """IP literals go straight to the CIDR check without DNS."""
+        with patch("socket.getaddrinfo") as mock_dns:
+            url_fetcher._validate_url("https://93.184.216.34/test.pdf")  # no raise
+            assert not mock_dns.called
 
-    def test_is_private_ip_link_local(self):
-        """Link-local addresses (cloud metadata) are detected."""
-        with patch(
-            "socket.getaddrinfo",
-            return_value=[
-                (2, 1, 6, "", ("169.254.169.254", 0)),
-            ],
-        ):
-            assert URLFetcher._is_private_ip("metadata.google") is True
+    # ── Malformed / edge cases ────────────────────────────────────────
 
-    def test_is_private_ip_public(self):
-        """Public IPs are not flagged as private."""
-        with patch(
-            "socket.getaddrinfo",
-            return_value=[
-                (2, 1, 6, "", ("93.184.216.34", 0)),
-            ],
-        ):
-            assert URLFetcher._is_private_ip("example.com") is False
+    def test_no_hostname_blocked(self, url_fetcher):
+        """URL with no hostname raises ValueError."""
+        with pytest.raises(ValueError, match="hostname"):
+            url_fetcher._validate_url("https://")
 
-    def test_dns_failure_treated_as_private(self):
-        """DNS resolution failure is treated as potentially dangerous."""
+    def test_dns_failure_raises(self, url_fetcher):
+        """DNS resolution failure surfaces as ValueError (not silent pass)."""
         with patch("socket.getaddrinfo", side_effect=OSError("DNS failed")):
-            assert URLFetcher._is_private_ip("unknown-host") is True
+            with pytest.raises(ValueError, match="DNS lookup"):
+                url_fetcher._validate_url("https://unknown-host/test.pdf")
 
 
 class TestDownloadSizeLimit:

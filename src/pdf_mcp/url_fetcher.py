@@ -1,5 +1,14 @@
-"""
-URL fetching utilities for downloading PDFs from HTTP/HTTPS sources.
+"""URL fetching utilities for downloading PDFs from HTTPS sources.
+
+The `_validate_url` method enforces the hardened URL floor adopted by this
+fork: HTTPS-only schemes + an explicit non-removable SSRF block list checked
+against every DNS-resolved IP. Mirrors the TypeScript implementation in the
+sibling `pdf-reader-mcp-more-secure` fork at `src/utils/urlValidator.ts`.
+
+Threat model note: there's a small TOCTOU gap between our DNS check here and
+httpx's lookup at fetch time. A DNS-rebinding attacker could return a public
+IP during validation and a private IP at fetch. Closing this would require
+pinning the validated IP via a custom httpx Transport. Accepted residual.
 """
 
 import hashlib
@@ -18,6 +27,23 @@ MAX_DOWNLOAD_SIZE = 100 * 1024 * 1024
 
 # Maximum number of HTTP redirects to follow
 MAX_REDIRECTS = 10
+
+# ── SSRF floor ────────────────────────────────────────────────────────────
+# Always enforced; not removable via user config. Any DNS-resolved IP that
+# falls into one of these ranges is rejected at validation time. Keeping the
+# list explicit (rather than relying on Python's `ipaddress.is_private` etc.)
+# lets SECURITY-AUDIT.md name each range precisely.
+SSRF_FLOOR_CIDRS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] = (
+    ipaddress.ip_network("127.0.0.0/8"),     # IPv4 loopback
+    ipaddress.ip_network("10.0.0.0/8"),      # RFC 1918 class A
+    ipaddress.ip_network("172.16.0.0/12"),   # RFC 1918 class B
+    ipaddress.ip_network("192.168.0.0/16"),  # RFC 1918 class C
+    ipaddress.ip_network("169.254.0.0/16"),  # IPv4 link-local (incl. 169.254.169.254 cloud metadata)
+    ipaddress.ip_network("0.0.0.0/8"),       # "This network" — common misconfig
+    ipaddress.ip_network("::1/128"),         # IPv6 loopback
+    ipaddress.ip_network("fc00::/7"),        # IPv6 unique local (ULA)
+    ipaddress.ip_network("fe80::/10"),       # IPv6 link-local
+)
 
 
 class URLFetcher:
@@ -44,60 +70,79 @@ class URLFetcher:
         self._url_to_path: dict[str, Path] = {}
 
     @staticmethod
-    def _is_private_ip(hostname: str) -> bool:
-        """Check if a hostname resolves to a private/reserved IP address."""
+    def _resolve_host_ips(hostname: str) -> list[str]:
+        """Resolve hostname to all (IPv4+IPv6) IP strings.
+
+        If the hostname is already an IP literal, returns [hostname] without
+        a DNS lookup. Raises OSError if DNS resolution fails.
+        """
+        # net.isIP-equivalent: if it already parses as an IP, skip DNS.
         try:
-            # Resolve hostname to IP addresses
-            addr_infos = socket.getaddrinfo(hostname, None)
-            for addr_info in addr_infos:
-                ip_str = addr_info[4][0]
-                ip = ipaddress.ip_address(ip_str)
-                if (
-                    ip.is_private
-                    or ip.is_loopback
-                    or ip.is_link_local
-                    or ip.is_reserved
-                    or ip.is_multicast
-                ):
-                    return True
-        except (OSError, ValueError):
-            # If we can't resolve, treat as potentially dangerous
-            return True
-        return False
+            ipaddress.ip_address(hostname)
+            return [hostname]
+        except ValueError:
+            pass
+        addr_infos = socket.getaddrinfo(hostname, None)
+        return list({info[4][0] for info in addr_infos})
+
+    @staticmethod
+    def _ip_in_floor(ip_str: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
+        """Return the SSRF_FLOOR_CIDRS entry this IP falls into, or None."""
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return None
+        for net in SSRF_FLOOR_CIDRS:
+            if isinstance(ip, ipaddress.IPv4Address) and isinstance(
+                net, ipaddress.IPv4Network
+            ):
+                if ip in net:
+                    return net
+            elif isinstance(ip, ipaddress.IPv6Address) and isinstance(
+                net, ipaddress.IPv6Network
+            ):
+                if ip in net:
+                    return net
+        return None
 
     def _validate_url(self, url: str) -> None:
-        """
-        Validate URL to prevent SSRF attacks.
+        """Validate URL against the hardened floor: https-only + SSRF deny.
 
-        Blocks:
-        - Private/internal IP ranges (10.x, 172.16-31.x, 192.168.x, 127.x)
-        - Link-local addresses (169.254.x - including cloud metadata endpoints)
-        - Localhost
-        - Non-HTTP(S) schemes
+        Floor is non-removable. User allow/deny rules (Phase 4) layer on top;
+        they can *further restrict* but cannot loosen this.
 
         Raises:
-            ValueError: If URL targets a blocked address
+            ValueError: If URL is malformed, non-https, or resolves to a
+                blocked address.
         """
-        parsed = urlparse(url)
+        try:
+            parsed = urlparse(url)
+        except ValueError as exc:
+            raise ValueError(f"Invalid URL: {url}: {exc}") from exc
 
-        if parsed.scheme not in ("http", "https"):
+        if parsed.scheme != "https":
             raise ValueError(
-                f"Only HTTP and HTTPS URLs are allowed, got: {parsed.scheme}"
+                f"Only https:// URLs are allowed (got '{parsed.scheme}:'): {url}"
             )
 
         hostname = parsed.hostname
         if not hostname:
             raise ValueError(f"Could not extract hostname from URL: {url}")
 
-        # Block obvious localhost references
-        if hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
-            raise ValueError(f"URLs targeting localhost are not allowed: {url}")
-
-        # Resolve hostname and check if it points to private/reserved IPs
-        if self._is_private_ip(hostname):
+        try:
+            resolved_ips = self._resolve_host_ips(hostname)
+        except OSError as exc:
             raise ValueError(
-                f"URL resolves to a private/reserved IP address and is blocked: {url}"
-            )
+                f"DNS lookup for '{hostname}' failed: {exc}"
+            ) from exc
+
+        for ip in resolved_ips:
+            blocked = self._ip_in_floor(ip)
+            if blocked is not None:
+                raise ValueError(
+                    f"URL '{url}' host '{hostname}' resolves to {ip}, "
+                    f"which is in a blocked range ({blocked}). SSRF floor."
+                )
 
     def _get_cache_filename(self, url: str) -> str:
         """Generate cache filename from URL."""
@@ -116,7 +161,15 @@ class URLFetcher:
         return f"{url_hash}.pdf"
 
     def is_url(self, source: str) -> bool:
-        """Check if source is a URL."""
+        """Check if source is a URL.
+
+        Returns True for both http:// and https:// prefixes so that
+        non-https URLs are still routed to the fetcher — which will then
+        reject them via _validate_url with a clear error. This gives the
+        user an informative failure ('https-only') instead of a confusing
+        'file not found' that would happen if we routed http:// to the
+        local-path branch.
+        """
         return source.startswith(("http://", "https://"))
 
     def get_local_path(self, url: str) -> Path | None:

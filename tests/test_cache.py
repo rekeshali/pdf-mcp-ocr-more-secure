@@ -757,19 +757,26 @@ class TestSchemaMigration:
                     PRIMARY KEY (file_path, page_num)
                 )
             """)
-            # Valid page_embeddings with a row
+            # Valid page_embeddings with a row. Schema must include both
+            # 'embedding' AND 'model_name' — the latter was added when this
+            # fork switched away from the upstream BAAI model; pre-migration
+            # rows are from a different vector space and get dropped.
             conn.execute("""
                 CREATE TABLE page_embeddings (
                     file_path  TEXT    NOT NULL,
                     page_num   INTEGER NOT NULL,
                     file_mtime REAL    NOT NULL,
                     embedding  BLOB    NOT NULL,
-                    PRIMARY KEY (file_path, page_num)
+                    model_name TEXT    NOT NULL,
+                    PRIMARY KEY (file_path, page_num, model_name)
                 )
             """)
             conn.execute(
-                "INSERT INTO page_embeddings VALUES (?, ?, ?, ?)",
-                ("/fake.pdf", 0, 1234567890.0, b"\x00" * 1536),
+                "INSERT INTO page_embeddings"
+                " (file_path, page_num, file_mtime, embedding, model_name)"
+                " VALUES (?, ?, ?, ?, ?)",
+                ("/fake.pdf", 0, 1234567890.0, b"\x00" * 1536,
+                 "nomic-ai/nomic-embed-text-v1.5"),
             )
 
         PDFCache(cache_dir=tmp_path)

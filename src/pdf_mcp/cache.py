@@ -106,10 +106,13 @@ class PDFCache:
             if cols and not {"file_path", "page_num", "text"}.issubset(cols):
                 conn.execute("DROP TABLE IF EXISTS page_text")
 
-            # page_embeddings: only drop if schema is actually broken — preserve
-            # existing embeddings (expensive to regenerate) whenever possible
+            # page_embeddings: drop if the schema is missing the 'embedding' column
+            # OR the 'model_name' column. The model_name column was introduced when
+            # the fork switched away from the upstream BAAI model; any pre-migration
+            # rows are from a different vector space and would produce garbage
+            # retrieval results if mixed with the current model's query vectors.
             cols = _get_columns(conn, "page_embeddings")
-            if cols and "embedding" not in cols:
+            if cols and ("embedding" not in cols or "model_name" not in cols):
                 conn.execute("DROP TABLE IF EXISTS page_embeddings")
 
             conn.executescript("""
@@ -171,14 +174,18 @@ class PDFCache:
                 CREATE INDEX IF NOT EXISTS idx_page_tables_path
                     ON page_tables(file_path);
 
-                -- Page embeddings cache (raw float32 BLOBs for semantic search)
+                -- Page embeddings cache (raw float32 BLOBs for semantic search).
+                -- model_name tags each row with the embedding model that produced
+                -- it; get_page_embeddings filters by current MODEL_NAME so stale
+                -- vectors from a prior model are transparently re-embedded.
                 CREATE TABLE IF NOT EXISTS page_embeddings (
                     file_path   TEXT    NOT NULL,
                     page_num    INTEGER NOT NULL,
                     file_mtime  REAL    NOT NULL,
                     embedding   BLOB    NOT NULL,
+                    model_name  TEXT    NOT NULL,
                     created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    PRIMARY KEY (file_path, page_num)
+                    PRIMARY KEY (file_path, page_num, model_name)
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_page_embeddings_path
@@ -576,11 +583,18 @@ class PDFCache:
 
     def get_page_embeddings(self, path: str, page_nums: list[int]) -> dict[int, bytes]:
         """
-        Get cached raw embedding bytes for multiple pages.
+        Get cached raw embedding bytes for multiple pages, scoped to the
+        currently-configured embedding model.
+
+        Filters on ``model_name = embedder.MODEL_NAME`` so vectors produced
+        by a prior model (different vector space, different dimensionality,
+        different prefix conventions) are transparently ignored and forced
+        to re-embed. Different models produce incompatible embeddings —
+        returning stale vectors would silently corrupt search rankings.
 
         Returns a dict mapping 0-indexed page_num to the raw float32 bytes
-        (1536 bytes = 384 × 4 bytes) for each page whose mtime is still valid.
-        Pages not in cache or with a stale mtime are omitted.
+        (1536 bytes = 384 × 4 bytes) for each page whose mtime is still valid
+        and whose stored model_name matches the current embedder.
 
         The caller is responsible for converting bytes to a numpy array:
             np.frombuffer(blob, dtype=np.float32).copy()
@@ -590,13 +604,18 @@ class PDFCache:
         if not page_nums:
             return {}
 
+        # Lazy import avoids forcing fastembed as a hard dep just for a name lookup.
+        from . import embedder as _emb  # noqa: PLC0415
+
         placeholders = ",".join("?" * len(page_nums))
         with sqlite3.connect(self.db_path) as conn:
             rows = conn.execute(
                 f"SELECT page_num, embedding, file_mtime"
                 f" FROM page_embeddings"
-                f" WHERE file_path = ? AND page_num IN ({placeholders})",
-                (path, *page_nums),
+                f" WHERE file_path = ?"
+                f"   AND model_name = ?"
+                f"   AND page_num IN ({placeholders})",
+                (path, _emb.MODEL_NAME, *page_nums),
             ).fetchall()
 
         result: dict[int, bytes] = {}
@@ -607,24 +626,31 @@ class PDFCache:
 
     def save_page_embeddings(self, path: str, embeddings: dict[int, bytes]) -> None:
         """
-        Save raw embedding bytes to cache.
+        Save raw embedding bytes to cache, tagged with the current model name.
 
         Args:
             path: Path to PDF file
             embeddings: Dict mapping 0-indexed page_num to raw float32 bytes.
                         Use ndarray.tobytes() to convert from numpy.
+
+        The current ``embedder.MODEL_NAME`` is stored alongside each row so
+        a future model swap causes stale vectors to be ignored by
+        ``get_page_embeddings`` without a manual cache purge.
         """
         if not embeddings:
             return
 
+        from . import embedder as _emb  # noqa: PLC0415
+
         mtime, _ = self._get_file_info(path)
+        model_name = _emb.MODEL_NAME
         with sqlite3.connect(self.db_path) as conn:
             conn.executemany(
                 "INSERT OR REPLACE INTO page_embeddings"
-                " (file_path, page_num, file_mtime, embedding)"
-                " VALUES (?, ?, ?, ?)",
+                " (file_path, page_num, file_mtime, embedding, model_name)"
+                " VALUES (?, ?, ?, ?, ?)",
                 [
-                    (path, page_num, mtime, blob)
+                    (path, page_num, mtime, blob, model_name)
                     for page_num, blob in embeddings.items()
                 ],
             )

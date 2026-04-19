@@ -1,370 +1,214 @@
-# pdf-mcp
+# pdf-mcp-ocr-more-secure
 
-[![PyPI version](https://img.shields.io/pypi/v/pdf-mcp)](https://pypi.org/project/pdf-mcp/)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![GitHub Issues](https://img.shields.io/github/issues/jztan/pdf-mcp)](https://github.com/jztan/pdf-mcp/issues)
-[![CI](https://github.com/jztan/pdf-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/jztan/pdf-mcp/actions/workflows/ci.yml)
-[![codecov](https://codecov.io/gh/jztan/pdf-mcp/graph/badge.svg)](https://codecov.io/gh/jztan/pdf-mcp)
-[![Downloads](https://pepy.tech/badge/pdf-mcp)](https://pepy.tech/project/pdf-mcp)
+A security-hardened fork of [jztan/pdf-mcp](https://github.com/jztan/pdf-mcp) with an added OCR fallback for scanned PDFs. Packaged as a Claude Code plugin for internal distribution on a locked-down workstation behind a trusted internal model proxy. The upstream README is preserved as [`README.OG.md`](./README.OG.md).
 
-A [Model Context Protocol](https://modelcontextprotocol.io/) (MCP) server that enables AI agents to read, search, and extract content from PDF files. Built with Python and PyMuPDF, with SQLite-based caching for persistence across server restarts.
+---
 
-**mcp-name: io.github.jztan/pdf-mcp**
+## What this is
 
-## Features
+An **MCP server** (Model Context Protocol — the stdio-based plugin interface Claude Code uses to expose local tools to the agent) that lets Claude read PDFs. Once installed, seven tools become available in every Claude Code session:
 
-- **7 specialized tools** for different PDF operations
-- **SQLite caching** — persistent cache survives server restarts (essential for STDIO transport)
-- **Paginated reading** — read large PDFs in manageable chunks
-- **Hybrid search** — combines BM25 keyword (FTS5) and semantic (local embeddings) via Reciprocal Rank Fusion; falls back to keyword-only without `pdf-mcp[semantic]`
-- **Image extraction** — per-page images returned as PNG file paths alongside text
-- **Table extraction** — per-page tables with header and row data, detected via visible borders
-- **URL support** — read PDFs from HTTP/HTTPS URLs
+- `pdf_info` — document metadata, page count, table of contents (inline for small TOCs).
+- `pdf_read_pages` — text, images, and tables from specific page ranges (`"1-5,10,15-20"`). OCR fallback for scanned pages.
+- `pdf_read_all` — full document text up to a page cap. OCR fallback for scanned pages.
+- `pdf_search` — hybrid keyword (BM25/FTS5) + semantic search via Reciprocal Rank Fusion. Semantic requires the `[semantic]` extra.
+- `pdf_get_toc` — extracts the document's table of contents.
+- `pdf_cache_stats` / `pdf_cache_clear` — inspect / trim the on-disk extraction cache.
+
+You don't invoke these directly. You tell Claude something like *"summarize `~/Downloads/paper.pdf`"* or *"find the section about cryo cooling in `/reports/manual.pdf`"* — Claude picks the tool, runs it, and works from the returned text.
+
+**OCR fallback:** when a page's embedded text layer is empty or sparse (<50 non-whitespace chars), the server renders the page at 300 DPI via PyMuPDF and runs it through Tesseract automatically. Scanned documents return readable text without the agent having to know the PDF is image-based. Callers can override with `force_ocr=True` (always OCR) or `skip_ocr=True` (never OCR).
+
+---
+
+## Why this fork
+
+Three layered concerns, in order:
+
+1. **Can this third-party package leak file contents to external actors?** The upstream has SSRF protections, but they use Python's `ipaddress.is_private/is_loopback/...` properties and allow `http://` as well as `https://`. This fork tightens the URL floor to `https://`-only with an explicit, documentable CIDR block list.
+2. **Can I audit what's actually in the dep tree?** Upstream has no pinned lockfile discipline ("`>=`" bounds everywhere). This fork exact-pins everything and enforces `uv sync --frozen` on install and in CI.
+3. **How do I make users without the `[ocr]` extra still see useful errors?** The upstream doesn't ship OCR at all; this fork adds it as an optional extra that degrades gracefully when missing.
+
+This is **not** a hardened-for-shared-deployment package. It is **not** a mitigation for AI-agent prompt injection.
+
+---
+
+## Threat model
+
+### In scope
+
+- The package code and its direct/transitive dependencies as a potential data-exfil vector.
+- Accidental network egress (URL-source fetches to unintended hosts).
+- Supply-chain install-time code execution.
+
+### Out of scope
+
+- **AI-agent risks** (prompt injection, agent misuse). Mitigate at the agent/policy layer, not here.
+- **Multi-user / shared-server deployments.** One user, one machine.
+- **Adversaries with physical or kernel access.**
+
+### Operating conditions under which this fork is considered secure
+
+1. Installed from your organization's internal mirror, not public PyPI.
+2. Claude Code CLI uses only a trusted internal model proxy.
+3. Single-user workstation on a secured internal network.
+4. Rebuilds use `uv sync --frozen` (blocks lockfile drift and install-time code in transitive deps).
+
+If any of these is not met, treat this fork as equivalent to the upstream package.
+
+---
+
+## What we changed vs upstream
+
+Hardening stacks as **hardcoded floor** (always on, not configurable) + **user layer** (optional additional restrictions on top). The user layer can narrow access further but cannot loosen the floor.
+
+| Hardening | Details |
+|---|---|
+| Hardcoded URL floor | Two checks that can't be disabled. **(1) Scheme must be `https:`** — `http:`, `file:`, `data:`, `blob:`, malformed URLs rejected at load time. **(2) SSRF block list** — every DNS-resolved IP is checked against `127.0.0.0/8`, `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `169.254.0.0/16` (link-local + cloud metadata `169.254.169.254`), `0.0.0.0/8`, `::1/128`, `fc00::/7` (IPv6 ULA), `fe80::/10` (IPv6 link-local). |
+| User-configurable layer (optional) | JSON config at `~/.claude/plugin-settings/pdf-mcp-ocr.json` lets you add allow/deny rules on top of the floor: hostname patterns for `url:` sources and path patterns for `path:` sources. Shell-glob syntax, deny wins on conflict. Cannot override the floor — if your allow list permits a host that resolves to a blocked IP, the request is still rejected. See **User config** section below. |
+| Exact-pinned deps | `pyproject.toml` uses `==` for every direct dep (with explained range exceptions for `numpy` and `pillow` due to cross-Python-version constraints). `uv.lock` pins the full resolved tree with SHA-256 hashes. `uv sync --frozen` blocks drift at install and in CI. |
+| OCR fallback added | `pytesseract` integration in `extractor.py`. Not a new tool — transparent fallback inside existing read tools when the text layer is sparse. Graceful degradation when the `[ocr]` extra isn't installed. |
+| Plugin install flow | Packaged as a Claude Code plugin with `.claude-plugin/plugin.json` and a `${CLAUDE_PLUGIN_ROOT}`-based `.mcp.json`. Install/uninstall/enable/disable scripts provided. |
+
+---
 
 ## Installation
 
-```bash
-pip install pdf-mcp
-```
+**Prerequisites:**
 
-For semantic search (adds `fastembed` and `numpy`, ~67 MB model download on first use):
-
-```bash
-pip install 'pdf-mcp[semantic]'
-```
-
-## Quick Start
-
-<details open>
-<summary><strong>Claude Code</strong></summary>
+- `uv` ([install](https://docs.astral.sh/uv/)) or `pip install uv`
+- `claude` CLI logged in
+- `tesseract` binary (only if you want OCR):
+  - macOS: `brew install tesseract`
+  - Debian/Ubuntu: `sudo apt install tesseract-ocr`
 
 ```bash
-claude mcp add pdf-mcp -- pdf-mcp
+git clone https://github.com/rekeshali/pdf-mcp-ocr-more-secure
+cd pdf-mcp-ocr-more-secure
+./install.sh
 ```
 
-Or add to `~/.claude.json`:
+`install.sh` runs `uv sync --frozen --extra ocr` to install Python deps from the locked set, drops a template config at `~/.claude/plugin-settings/pdf-mcp-ocr.json` if missing, then `claude plugin install . --scope user`. Idempotent on re-run.
+
+**Verify:**
+
+```bash
+claude plugin list     # should list pdf-mcp-ocr
+```
+
+Inside a Claude session: `/mcp` shows `pdf-mcp-ocr` as a connected server.
+
+---
+
+## User config
+
+Optional. File location: **`~/.claude/plugin-settings/pdf-mcp-ocr.json`**. All fields optional; missing fields = permissive within the floor.
 
 ```json
 {
-  "mcpServers": {
-    "pdf-mcp": {
-      "command": "pdf-mcp"
-    }
+  "path": {
+    "allow": ["~/Documents/claude-pdfs/**"],
+    "deny":  ["~/.ssh/**", "~/.aws/**"]
+  },
+  "url": {
+    "allow": ["*.internal.example.com", "docs.corp.example.com"],
+    "deny":  ["evil.example.com"]
   }
 }
 ```
 
-</details>
+**Semantics:**
 
-<details>
-<summary><strong>Claude Desktop</strong></summary>
+- `path` rules apply to the `path:` source; `url` rules apply to the `url:` source (host match only).
+- Path patterns are shell globs (`fnmatch`) with leading `~` expansion.
+- URL host patterns: `*` matches any characters including dots (wildcard-cert style), case-insensitive.
+- If `allow` is non-empty, the input **must** match one entry. Empty allow = permissive within the floor.
+- `deny` is checked too. **Deny wins** when both match (fail-closed).
+- **Always-on floor:** scheme floor (https-only) and SSRF block list are enforced regardless of this config. The user `url.allow` cannot permit a host that resolves to a blocked IP.
+- **No hot reload.** Config is cached on first read; edits require restarting the MCP server (`./disable.sh && ./enable.sh`).
 
-Add to your `claude_desktop_config.json`:
+**Known caveat — DNS rebinding:** we resolve the URL host at validation time, then `httpx` resolves it again at fetch time. An attacker controlling DNS for an allow-listed host could return a public IP for our lookup and a private IP for httpx's. Closing this would require a custom httpx transport that pins the validated IP. Accepted residual for this fork.
 
-```json
-{
-  "mcpServers": {
-    "pdf-mcp": {
-      "command": "pdf-mcp"
-    }
-  }
-}
-```
+---
 
-Config file location:
-- macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`
-- Windows: `%APPDATA%\Claude\claude_desktop_config.json`
+## Usage
 
-Restart Claude Desktop after updating the config.
+Once installed, the seven tools are available in any Claude Code session. Ask naturally:
 
-</details>
+> Read `/path/to/report.pdf` and summarize section 3.
+>
+> What's in `~/Downloads/scanned-manual.pdf`? It's an image-based scan.
+>
+> Summarize https://internal.example.com/manuals/foo.pdf — just the table of contents.
+>
+> Search for "cryogenic cooling" in `/path/to/paper.pdf`.
 
-<details>
-<summary><strong>Visual Studio Code</strong></summary>
+For scanned PDFs, OCR runs automatically when the text layer is empty. You'll see `ocr_used: true` and a confidence indicator (`"high"` >10 tokens, `"low"` otherwise) in the returned data.
 
-Requires VS Code 1.102+ with GitHub Copilot.
+See [`README.OG.md`](./README.OG.md) for the full tool schema with all parameters.
 
-**CLI:**
-```bash
-code --add-mcp '{"name":"pdf-mcp","command":"pdf-mcp"}'
-```
+---
 
-**Command Palette:**
-1. Open Command Palette (`Cmd/Ctrl+Shift+P`)
-2. Run `MCP: Open User Configuration` (global) or `MCP: Open Workspace Folder Configuration` (project-specific)
-3. Add the configuration:
-   ```json
-   {
-     "servers": {
-       "pdf-mcp": {
-         "command": "pdf-mcp"
-       }
-     }
-   }
-   ```
-4. Save. VS Code will automatically load the server.
-
-**Manual:** Create `.vscode/mcp.json` in your workspace:
-```json
-{
-  "servers": {
-    "pdf-mcp": {
-      "command": "pdf-mcp"
-    }
-  }
-}
-```
-
-</details>
-
-<details>
-<summary><strong>Codex CLI</strong></summary>
+## Update, disable, uninstall
 
 ```bash
-codex mcp add pdf-mcp -- pdf-mcp
+./disable.sh      # stop Claude from loading it (plugin stays installed)
+./enable.sh       # turn it back on
+./uninstall.sh    # fully remove the plugin
 ```
 
-Or configure manually in `~/.codex/config.toml`:
+To update: `git pull` in your clone, then re-run `./install.sh`. The plugin is copied into Claude's plugin cache at install time, so pulling alone does nothing — the re-install step is required.
 
-```toml
-[mcp_servers.pdf-mcp]
-command = "pdf-mcp"
-```
+---
 
-</details>
+## Gotchas
 
-<details>
-<summary><strong>Kiro</strong></summary>
+1. **Plugin cache is not a live link.** The plugin directory Claude loads is a *copy* made at install time. Editing files in your clone has no effect until `./install.sh`.
+2. **Opening this repo in Claude Code shows a cosmetic `pdf-mcp-ocr` failure.** The tracked `.mcp.json` uses `${CLAUDE_PLUGIN_ROOT}`, which only resolves inside the plugin context. Project-scope load fails; the installed plugin is unaffected.
+3. **`tesseract` is a system binary, not a Python package.** `install.sh` warns if missing. OCR fallback degrades gracefully (returns original sparse text + error info) when pytesseract can't import. Set `skip_ocr=True` to suppress the attempt.
+4. **Re-running `./install.sh` fully replaces the prior install.** Idempotent by design.
+5. **DNS rebinding TOCTOU is not closed.** Documented as an accepted residual in the User config section.
+6. **Known pre-existing flaky test:** `tests/test_cache.py::TestPageEmbeddingsLifecycle::test_clear_expired_removes_stale_embeddings` is timing-sensitive on fast machines (compares `accessed_at < now() - 0h`, fails on microsecond-resolution gaps). Inherited from upstream. 338/339 pass; unrelated to hardening.
 
-Create or edit `.kiro/settings/mcp.json` in your workspace:
+---
 
-```json
-{
-  "mcpServers": {
-    "pdf-mcp": {
-      "command": "pdf-mcp",
-      "args": [],
-      "disabled": false
-    }
-  }
-}
-```
+## Rebuilding from source
 
-Save and restart Kiro.
-
-</details>
-
-<details>
-<summary><strong>Other MCP Clients</strong></summary>
-
-Most MCP clients use a standard configuration format:
-
-```json
-{
-  "mcpServers": {
-    "pdf-mcp": {
-      "command": "pdf-mcp"
-    }
-  }
-}
-```
-
-With `uvx` (for isolated environments):
-
-```json
-{
-  "mcpServers": {
-    "pdf-mcp": {
-      "command": "uvx",
-      "args": ["pdf-mcp"]
-    }
-  }
-}
-```
-
-</details>
-
-### Verify Installation
+Only needed if you're modifying code:
 
 ```bash
-pdf-mcp --help
+uv sync --frozen --extra dev --extra ocr
+uv run pytest
+uv run pip-audit
 ```
 
-## Tools
+- `--frozen` refuses to modify `uv.lock`; if any resolution would change, install fails loudly instead of silently drifting.
+- `--extra ocr` brings in `pytesseract` + `pillow` (still needs the `tesseract` system binary).
+- `--extra dev` brings in pytest, mypy, pip-audit, etc.
 
-### `pdf_info` — Get Document Information
+---
 
-Returns page count, metadata, file size, and estimated token count. **Call this first** to understand a document before reading it. Includes `toc_entry_count` and inline TOC entries when the document has ≤50 bookmarks; larger TOCs (e.g. slide decks) return `toc_truncated: true` — use `pdf_get_toc` to retrieve the full outline.
+## Supply-chain and CI
 
-```
-"Read the PDF at /path/to/document.pdf"
-```
+Two workflows at `.github/workflows/`:
 
-### `pdf_read_pages` — Read Specific Pages
+- **`pdf-mcp-ocr-ci.yml`** — runs on push to `develop`/`main` and on PRs. Installs with `uv sync --frozen`, runs `pip-audit` (CVE scan against pinned versions), the test suite, and a smoke import. Workflow fails on issues; merge-blocking requires branch protection / rulesets configured at the repo level.
+- **`pdf-mcp-ocr-audit.yml`** — runs daily at 13:00 UTC + `workflow_dispatch`. Just `uv sync --frozen` + `pip-audit`. Catches newly-disclosed CVEs against already-pinned versions (push-based CI can't see these).
 
-Read selected pages to manage context size. Each page dict includes `text`, `images`/`image_count`, and `tables`/`table_count`. Tables are extracted as structured data (header + rows) and inlined directly in the page response — no separate tool call needed. Table detection requires visible borders in the PDF.
+Both files expose a single `TOOL_PATH` env var at the top so they can drop into a monorepo with a one-line edit. Grep for `CHANGE-AFTER-MOVE` when relocating.
 
-```
-"Read pages 1-10 of the PDF"
-"Read pages 15, 20, and 25-30"
-```
+**Dep-update discipline:** changes must go through a PR that modifies both `pyproject.toml` and `uv.lock`, with human review of the lockfile diff. Do not run `uv lock` or `uv sync` without `--frozen` on release branches.
 
-### `pdf_read_all` — Read Entire Document
+---
 
-Read a complete document in one call. Subject to a safety limit on page count.
+## Dev-time notes
 
-```
-"Read the entire PDF (it's only 10 pages)"
-```
+- Upstream's dev scripts (`scripts/benchmark_rrf.py`, `scripts/compare_search.py`) are preserved for perf comparisons. They're dev-only; never auto-invoked. Documented in `SECURITY-AUDIT.md` as dev-only code surface.
+- Full audit receipts live in [`SECURITY-AUDIT.md`](./SECURITY-AUDIT.md).
+- Test suite: `uv run pytest` (338 pass / 1 pre-existing jztan flake).
 
-### `pdf_search` — Search Within PDF
-
-Find relevant pages before loading content. The default mode is **hybrid** — Reciprocal Rank Fusion (RRF) merges BM25 keyword results and semantic embedding results into a single ranked list. This consistently outperforms either method alone: keyword search finds exact terms that embeddings miss; semantic search finds conceptual matches that keyword search misses; RRF fusion captures both.
-
-Three modes are available:
-
-- **`mode="auto"` (default)** — Hybrid RRF when `pdf-mcp[semantic]` is installed; keyword-only fallback otherwise.
-- **`mode="keyword"`** — BM25/FTS5 only. Best for exact identifiers, product codes, precise terms.
-- **`mode="semantic"`** — Semantic only (requires `pdf-mcp[semantic]`). Best for conceptual queries.
-
-Response includes `search_mode: "hybrid" | "keyword" | "semantic"` indicating which path ran.
-
-The first call on a new document embeds all pages (one-time cost, ~291ms for 200 pages); subsequent calls are instant.
-
-```
-"Search for 'quarterly revenue' in the PDF"
-"Find pages about revenue growth in the PDF"
-"Which pages discuss supply chain risks?"
-```
-
-### `pdf_get_toc` — Get Table of Contents
-
-```
-"Show me the table of contents"
-```
-
-### `pdf_cache_stats` — View Cache Statistics
-
-```
-"Show PDF cache statistics"
-```
-
-### `pdf_cache_clear` — Clear Cache
-
-```
-"Clear expired PDF cache entries"
-```
-
-## Example Workflow
-
-For a large document (e.g., a 200-page annual report):
-
-```
-User: "Summarize the risk factors in this annual report"
-
-Agent workflow:
-1. pdf_info("report.pdf")
-   → 200 pages, TOC shows "Risk Factors" on page 89
-
-2. pdf_search("report.pdf", "risk factors")
-   → Relevant pages: 89-110
-
-3. pdf_read_pages("report.pdf", "89-100")
-   → First batch
-
-4. pdf_read_pages("report.pdf", "101-110")
-   → Second batch
-
-5. Synthesize answer from chunks
-```
-
-## Caching
-
-The server uses SQLite for persistent caching. This is necessary because MCP servers using STDIO transport are spawned as a new process for each conversation.
-
-**Cache location:** `~/.cache/pdf-mcp/cache.db`
-
-**What's cached:**
-
-| Data | Benefit |
-|------|---------|
-| Metadata | Avoid re-parsing document info |
-| Page text | Skip re-extraction |
-| Images | Skip re-encoding |
-| Tables | Skip re-detection |
-| TOC | Skip re-parsing |
-| FTS5 index | O(log N) search with BM25 ranking after first query |
-| Embeddings | Instant semantic search after first indexing run |
-
-**Cache invalidation:**
-- Automatic when file modification time changes
-- Manual via the `pdf_cache_clear` tool
-- TTL: 24 hours (configurable)
-
-## Configuration
-
-Environment variables:
-
-```bash
-# Cache directory (default: ~/.cache/pdf-mcp)
-PDF_MCP_CACHE_DIR=/path/to/cache
-
-# Cache TTL in hours (default: 24)
-PDF_MCP_CACHE_TTL=48
-```
-
-## Development
-
-```bash
-git clone https://github.com/jztan/pdf-mcp.git
-cd pdf-mcp
-
-# Install with dev dependencies
-pip install -e ".[dev]"
-
-# Run tests
-pytest tests/ -v
-
-# Type checking
-mypy src/
-
-# Linting
-flake8 src/ tests/
-
-# Formatting
-black src/ tests/
-```
-
-## Why pdf-mcp?
-
-| | Without pdf-mcp | With pdf-mcp |
-|---|---|---|
-| Large PDFs | Context overflow | Chunked reading |
-| Token budgeting | Guess and overflow | Estimated tokens before reading |
-| Finding content | Load everything | Hybrid search — RRF fusion of BM25 keyword (FTS5) + semantic embeddings; never misses what either alone would |
-| Tables | Lost in raw text | Extracted and inlined per page |
-| Images | Ignored | Extracted as PNG files |
-| Repeated access | Re-parse every time | SQLite cache |
-| Tool design | Single monolithic tool | 7 specialized tools |
-
-## Roadmap
-
-See [ROADMAP.md](ROADMAP.md) for planned features and release history.
-
-## Contributing
-
-Contributions are welcome. Please submit a pull request.
+---
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
-
-## Links
-
-- [pdf-mcp on PyPI](https://pypi.org/project/pdf-mcp/)
-- [pdf-mcp on GitHub](https://github.com/jztan/pdf-mcp)
-- [How I Built pdf-mcp](https://blog.jztan.com/how-i-built-pdf-mcp-solving-claude-large-pdf-limitations/) — The problem with large PDFs in AI agents and a working solution
-- [MCP Server Security: 8 Vulnerabilities](https://blog.jztan.com/mcp-server-security-8-vulnerabilities/) — What we found when we audited an MCP server for security holes
-- [How Claude Code Actually Reads PDFs](https://blog.jztan.com/how-claude-code-actually-reads-pdfs-lessons-from-building-an-mcp-server/) — How chunked reading, FTS5, and SQLite caching work together
-- [Semantic vs Keyword Search for AI Agents](https://blog.jztan.com/semantic-vs-keyword-search-ai-agents/) — Benchmarks and a dual-search routing pattern: FTS5 for exact identifiers, embeddings for natural language
+MIT, inherited from upstream. See [`LICENSE`](./LICENSE).

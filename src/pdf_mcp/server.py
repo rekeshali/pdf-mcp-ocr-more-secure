@@ -251,6 +251,7 @@ def pdf_read_pages(
     ocr_language: str = "eng",
     force_ocr: bool = False,
     skip_ocr: bool = False,
+    preprocess_ocr: bool = True,
 ) -> dict[str, Any]:
     """
     Read text content and images from specific pages of a PDF.
@@ -331,6 +332,7 @@ def pdf_read_pages(
                     ocr_language=ocr_language,
                     force_ocr=force_ocr,
                     skip_ocr=skip_ocr,
+                    preprocess_ocr=preprocess_ocr,
                 )
                 if ocr_info["ocr_used"]:
                     ocr_pages += 1
@@ -411,6 +413,7 @@ def pdf_read_all(
     ocr_language: str = "eng",
     force_ocr: bool = False,
     skip_ocr: bool = False,
+    preprocess_ocr: bool = True,
 ) -> dict[str, Any]:
     """
     Read the entire PDF document.
@@ -471,6 +474,7 @@ def pdf_read_all(
                     ocr_language=ocr_language,
                     force_ocr=force_ocr,
                     skip_ocr=skip_ocr,
+                    preprocess_ocr=preprocess_ocr,
                 )
                 if ocr_info["ocr_used"]:
                     ocr_pages += 1

@@ -135,6 +135,120 @@ def extract_text_from_page(page: Any, sort_by_position: bool = True) -> str:
         return str(page.get_text())
 
 
+def _otsu_threshold(gray: Any) -> int:
+    """Return the Otsu-optimal threshold for an 8-bit grayscale numpy array.
+
+    Pure-numpy implementation so this file stays in the lightest-weight
+    dep tree possible (no OpenCV, no scikit-image). Otsu finds the
+    threshold that maximises between-class variance — i.e. the cut that
+    best separates 'ink' from 'paper' pixels in a scanned document.
+    """
+    import numpy as np
+
+    hist, _ = np.histogram(gray.ravel(), bins=256, range=(0, 256))
+    total = gray.size
+    sum_total = (np.arange(256) * hist).sum()
+    sum_bg = 0.0
+    weight_bg = 0
+    best_var = -1.0
+    best_thresh = 127
+    for t in range(256):
+        weight_bg += int(hist[t])
+        if weight_bg == 0:
+            continue
+        weight_fg = total - weight_bg
+        if weight_fg == 0:
+            break
+        sum_bg += t * hist[t]
+        mean_bg = sum_bg / weight_bg
+        mean_fg = (sum_total - sum_bg) / weight_fg
+        var_between = weight_bg * weight_fg * (mean_bg - mean_fg) ** 2
+        if var_between > best_var:
+            best_var = var_between
+            best_thresh = t
+    return best_thresh
+
+
+def _estimate_skew_degrees(bin_image: Any, max_deg: float = 5.0, step_deg: float = 0.5) -> float:
+    """Estimate page skew via projection-profile maximisation.
+
+    Rotates a downsampled binary image across +/- max_deg, computes the row-
+    wise projection profile's variance at each angle, and returns the angle
+    that maximises variance. Higher variance = rows are sharper horizontal
+    bands of text = less skew.
+
+    Returns the rotation angle in degrees (positive = counter-clockwise
+    correction needed). Operates on a downsampled copy for speed — the
+    final rotation uses the detected angle on the full-resolution image.
+    """
+    import numpy as np
+    from PIL import Image
+
+    # Downsample for speed — skew detection doesn't need pixel-perfect input.
+    small = Image.fromarray(bin_image)
+    if max(small.size) > 800:
+        scale = 800 / max(small.size)
+        small = small.resize(
+            (int(small.size[0] * scale), int(small.size[1] * scale)),
+            Image.Resampling.BILINEAR,
+        )
+    small_arr = np.asarray(small)
+    # Invert so text is 1 (on white-paper assumption, Otsu gives text=0, bg=255).
+    inv = 255 - small_arr
+
+    best_var = -1.0
+    best_angle = 0.0
+    # Sweep angles; Pillow rotation is fast enough to try many.
+    angles = np.arange(-max_deg, max_deg + step_deg, step_deg)
+    for angle in angles:
+        rotated = Image.fromarray(inv).rotate(
+            float(angle),
+            resample=Image.Resampling.BILINEAR,
+            fillcolor=0,
+        )
+        row_sums = np.asarray(rotated).sum(axis=1)
+        variance = float(row_sums.var())
+        if variance > best_var:
+            best_var = variance
+            best_angle = float(angle)
+    return best_angle
+
+
+def _preprocess_for_ocr(img: Any) -> Any:
+    """Apply binarize + deskew to improve OCR accuracy on scanned pages.
+
+    Returns a new PIL Image. Input can be any PIL mode — converted to
+    grayscale first. Caller handles import of PIL lazily.
+
+    Deskew uses the Otsu-binarized image to estimate the rotation angle,
+    then rotates the ORIGINAL grayscale (not the binary) to avoid stacking
+    threshold + rotation artifacts. Tesseract prefers anti-aliased grayscale
+    input over hard-binary, so the final image we hand it is rotated
+    grayscale.
+    """
+    import numpy as np
+    from PIL import Image
+
+    gray = img.convert("L")
+    gray_arr = np.asarray(gray)
+
+    # Binarize (for skew estimation, not final output).
+    threshold = _otsu_threshold(gray_arr)
+    bin_arr = (gray_arr > threshold).astype(np.uint8) * 255
+
+    # Estimate skew on the binary; apply rotation to grayscale.
+    skew = _estimate_skew_degrees(bin_arr)
+    if abs(skew) < 0.25:
+        return gray  # no correction worth doing
+
+    return gray.rotate(
+        skew,
+        resample=Image.Resampling.BICUBIC,
+        fillcolor=255,  # match paper background
+        expand=True,
+    )
+
+
 def extract_text_with_ocr_fallback(
     page: Any,
     *,
@@ -144,6 +258,7 @@ def extract_text_with_ocr_fallback(
     skip_ocr: bool = False,
     sort_by_position: bool = True,
     dpi: int = 300,
+    preprocess_ocr: bool = True,
 ) -> tuple[str, dict[str, Any]]:
     """Extract page text, falling back to OCR when the embedded text layer is sparse.
 
@@ -167,6 +282,13 @@ def extract_text_with_ocr_fallback(
         sort_by_position: Passed to extract_text_from_page.
         dpi: Rendering DPI for OCR. 300 is a reasonable default for scanned
             documents; higher gives better accuracy at quadratic time cost.
+        preprocess_ocr: If True (default), apply Otsu binarization-based skew
+            estimation + deskew rotation to the rendered page before handing
+            it to Tesseract. Improves accuracy on real scanned documents
+            (misaligned feeder scans, off-axis photos). Set False to hand
+            Tesseract the raw rendered image — slightly faster, and the
+            right choice when the input is guaranteed clean (e.g. you're
+            OCR'ing a computer-generated PDF via force_ocr for some reason).
 
     Returns:
         Tuple of (text, info) where info is:
@@ -174,14 +296,18 @@ def extract_text_with_ocr_fallback(
                 "ocr_used": bool,
                 "ocr_confidence": "high" | "low" | None,
                 "ocr_error": str | None,
+                "ocr_skew_corrected_deg": float | None,
             }
         confidence is "high" if OCR produced >10 whitespace-separated tokens,
         "low" otherwise (borrowed from labeveryday). None when OCR wasn't run.
+        ocr_skew_corrected_deg is the rotation angle applied during
+        preprocessing (None if preprocess_ocr=False or no skew detected).
     """
     info: dict[str, Any] = {
         "ocr_used": False,
         "ocr_confidence": None,
         "ocr_error": None,
+        "ocr_skew_corrected_deg": None,
     }
 
     text = "" if force_ocr else extract_text_from_page(page, sort_by_position=sort_by_position)
@@ -218,6 +344,34 @@ def extract_text_with_ocr_fallback(
         from io import BytesIO
 
         img = Image.open(BytesIO(img_bytes))
+
+        if preprocess_ocr:
+            try:
+                import numpy as np
+
+                # Only record the skew angle; the rotated image is the result.
+                pre = _preprocess_for_ocr(img)
+                # _preprocess returns grayscale; capture the angle for metadata.
+                # Re-estimate cheaply on the rotated result — should be ~0 now.
+                # If original was rotated, pre.size != img.size (expand=True),
+                # which is the observable signal that rotation was applied.
+                original_size = img.size
+                img = pre
+                if img.size != original_size:
+                    # Capture the angle estimated on the PRE-rotation image for reporting.
+                    gray_arr = np.asarray(Image.open(BytesIO(img_bytes)).convert("L"))
+                    thresh = _otsu_threshold(gray_arr)
+                    bin_arr = (gray_arr > thresh).astype(np.uint8) * 255
+                    info["ocr_skew_corrected_deg"] = _estimate_skew_degrees(bin_arr)
+            except ImportError:
+                # numpy missing — preprocessing unavailable, proceed with raw render.
+                logger.warning(
+                    "numpy not available; skipping OCR preprocessing. Install "
+                    "[semantic] or [dev] extra (or just `pip install numpy`) to enable."
+                )
+            except Exception as exc:  # pragma: no cover
+                logger.warning("OCR preprocessing failed (%s); using raw render.", exc)
+
         ocr_text = pytesseract.image_to_string(
             img,
             lang=ocr_language,

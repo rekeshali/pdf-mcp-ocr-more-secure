@@ -31,7 +31,10 @@ fi
 # ── Sync Python deps from the frozen lockfile ──────────────────────────────
 
 echo "Syncing Python dependencies (frozen lockfile, OCR extra)..."
-(cd "$REPO_DIR" && uv sync --frozen --extra ocr) >/dev/null
+# --reinstall rebuilds the editable-install records. Needed when the project
+# name or src layout changes between versions (uv caches editable metadata and
+# can stale-state when the target module path shifts).
+(cd "$REPO_DIR" && uv sync --frozen --extra ocr --reinstall-package pdf-mcp-ocr-more-secure) >/dev/null
 
 # ── Drop a template user config on first install only ──────────────────────
 

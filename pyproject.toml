@@ -4,7 +4,7 @@ version = "1.8.0"
 description = "Production-ready MCP server for PDF processing with intelligent caching. Extract text, search, and analyze PDFs with AI agents."
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.10"
+requires-python = ">=3.11,<3.13"
 authors = [
     { name = "Kevin Tan", email = "jingzheng.tan@gmail.com" }
 ]
@@ -40,33 +40,41 @@ classifiers = [
 ]
 
 dependencies = [
-    "fastmcp>=3.0.0",
-    "pymupdf>=1.24.0",
-    "pydantic>=2.0",
-    "httpx>=0.27.0",
+    # Pinned exactly — no `>=`. Combined with `uv.lock` (committed, contains
+    # per-package hashes) and `uv sync --frozen` in install paths + CI, this
+    # blocks future-malicious-version auto-install and registry tarball swaps.
+    # See SECURITY-AUDIT.md for the supply-chain chapter and the re-lock recipe.
+    "fastmcp==3.2.0",
+    "pymupdf==1.27.2.2",
+    "pydantic==2.12.5",
+    "httpx==0.28.1",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=8.0",
-    "pytest-asyncio>=0.23.0",
-    "pytest-cov>=4.0",
-    "pillow>=10.0",
-    "mypy>=1.8.0",
-    "flake8>=7.0",
-    "black>=26.3.1",
-    "pip-audit>=2.7.0",
-    "numpy>=1.24",
+    "pytest==9.0.3",
+    "pytest-asyncio==1.3.0",
+    "pytest-cov==7.1.0",
+    "pillow>=12.2.0,<13.0",
+    "mypy==1.19.1",
+    "flake8==7.3.0",
+    "black==26.3.1",
+    "pip-audit==2.10.0",
+    # numpy has unusual cross-Python version constraints (2.3+ requires 3.11+),
+    # so this is a compatible-range pin rather than exact. The committed
+    # uv.lock pins to a single concrete version + hashes, so the supply-chain
+    # control is not weakened.
+    "numpy>=2.2.6,<3.0.0",
 ]
 
 semantic = [
-    "fastembed>=0.7,<1.0",
-    "numpy>=1.24",
+    "fastembed==0.8.0",
+    "numpy>=2.2.6,<3.0.0",
 ]
 
 ocr = [
-    "pytesseract>=0.3.10",
-    "pillow>=10.0",
+    "pytesseract==0.3.13",
+    "pillow>=12.2.0,<13.0",
 ]
 
 [project.urls]
@@ -82,6 +90,18 @@ pdf-mcp = "pdf_mcp.server:main"
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# Constraint-dependencies force transitive deps to specific versions without
+# declaring them as our own runtime deps. Used to pin away from CVEs surfaced
+# by pip-audit. These are NOT added to the install closure; they only kick in
+# when a transitive dep would otherwise pick a vulnerable version.
+[tool.uv]
+constraint-dependencies = [
+    "authlib>=1.6.11",          # GHSA-jj8c-mmj3-mmgv (via fastmcp chain)
+    "cryptography>=46.0.7",     # CVE-2026-39892 (via authlib / httpx chain)
+    "pygments>=2.20.0",         # CVE-2026-4539 (via pip-audit / other tooling)
+    "python-multipart>=0.0.26", # CVE-2026-40347 (via fastmcp chain)
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "strict"

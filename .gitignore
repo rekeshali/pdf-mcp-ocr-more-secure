@@ -87,3 +87,8 @@ docs/superpowers/
 # MCP Registry
 .mcpregistry_github_token
 .mcpregistry_registry_token
+
+# Personal / local-only scratch (never committed)
+TODO.local.md
+*.local.md
+.notes/

@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "pdf-mcp-ocr": {
+      "command": "uv",
+      "args": ["run", "--directory", "${CLAUDE_PLUGIN_ROOT}", "pdf-mcp-ocr"]
+    }
+  }
+}

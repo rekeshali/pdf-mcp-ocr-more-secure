@@ -1,0 +1,5 @@
+{
+  "name": "pdf-mcp-ocr",
+  "version": "0.1.0",
+  "description": "Hardened PDF reader MCP with OCR fallback (internal fork of jztan/pdf-mcp)."
+}

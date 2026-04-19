@@ -1,15 +1,15 @@
 [project]
-name = "pdf-mcp"
-version = "1.8.0"
-description = "Production-ready MCP server for PDF processing with intelligent caching. Extract text, search, and analyze PDFs with AI agents."
+name = "pdf-mcp-ocr-more-secure"
+version = "0.1.0"
+description = "Hardened MCP PDF reader with pytesseract OCR fallback. Internal fork of jztan/pdf-mcp; strips upstream publishing code, pins deps, adds an always-on HTTPS-only + SSRF floor for URL sources and a user-configurable path/URL allow-deny layer. For single-user installation on a locked-down workstation on a secured internal network."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11,<3.13"
 authors = [
-    { name = "Kevin Tan", email = "jingzheng.tan@gmail.com" }
+    { name = "rma" }
 ]
 maintainers = [
-    { name = "Kevin Tan", email = "jingzheng.tan@gmail.com" }
+    { name = "rma" }
 ]
 keywords = [
     "mcp",
@@ -78,18 +78,21 @@ ocr = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/jztan/pdf-mcp"
-Documentation = "https://github.com/jztan/pdf-mcp#readme"
-Repository = "https://github.com/jztan/pdf-mcp"
-Issues = "https://github.com/jztan/pdf-mcp/issues"
-Changelog = "https://github.com/jztan/pdf-mcp/blob/master/CHANGELOG.md"
+Homepage = "https://github.com/rekeshali/pdf-mcp-ocr-more-secure"
+Repository = "https://github.com/rekeshali/pdf-mcp-ocr-more-secure"
+Upstream = "https://github.com/jztan/pdf-mcp"
 
 [project.scripts]
-pdf-mcp = "pdf_mcp.server:main"
+pdf-mcp-ocr = "pdf_mcp.server:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# Source lives at src/pdf_mcp/ (inherited from upstream jztan/pdf-mcp) but our
+# project name doesn't match the module name. Tell hatchling explicitly.
+[tool.hatch.build.targets.wheel]
+packages = ["src/pdf_mcp"]
 
 # Constraint-dependencies force transitive deps to specific versions without
 # declaring them as our own runtime deps. Used to pin away from CVEs surfaced

@@ -1,0 +1,36 @@
+name: pdf-mcp-ocr Scheduled Audit
+
+# ──────────────────────────────────────────────────────────────────────
+# Monorepo relocation: change TOOL_PATH below.
+#
+# Runs daily at 13:00 UTC. Catches newly-disclosed CVEs against
+# already-pinned versions (push-based CI can't detect these — code
+# didn't change, advisory did). Default GitHub behavior emails repo
+# owners on failure only.
+# ──────────────────────────────────────────────────────────────────────
+
+on:
+  schedule:
+    - cron: '0 13 * * *'
+  workflow_dispatch:
+
+env:
+  TOOL_PATH: '.' # CHANGE-AFTER-MOVE → 'pdf-mcp-ocr'
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "0.11.7"
+
+      - name: Install (frozen lockfile, dev extra for pip-audit)
+        working-directory: ${{ env.TOOL_PATH }}
+        run: uv sync --frozen --extra dev
+
+      - name: Audit deps (pip-audit)
+        working-directory: ${{ env.TOOL_PATH }}
+        run: uv run pip-audit --timeout 60

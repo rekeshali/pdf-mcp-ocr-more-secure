@@ -1,0 +1,48 @@
+name: pdf-mcp-ocr CI
+
+# ──────────────────────────────────────────────────────────────────────
+# Monorepo relocation: when you move this file into agent-tools, change
+# the two values marked `CHANGE-AFTER-MOVE` below.  Nothing else needs
+# editing.
+# ──────────────────────────────────────────────────────────────────────
+
+on:
+  push:
+    branches: [develop, main]
+    paths:
+      - '**' # CHANGE-AFTER-MOVE → 'pdf-mcp-ocr/**'
+  pull_request:
+    paths:
+      - '**' # CHANGE-AFTER-MOVE → 'pdf-mcp-ocr/**'
+
+env:
+  TOOL_PATH: '.' # CHANGE-AFTER-MOVE → 'pdf-mcp-ocr'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v4
+        with:
+          version: "0.11.7"
+
+      - name: Install tesseract (for OCR tests)
+        run: sudo apt-get update && sudo apt-get install -y tesseract-ocr
+
+      - name: Install (frozen lockfile, dev + ocr extras)
+        working-directory: ${{ env.TOOL_PATH }}
+        run: uv sync --frozen --extra dev --extra ocr
+
+      - name: Audit deps (pip-audit)
+        working-directory: ${{ env.TOOL_PATH }}
+        run: uv run pip-audit --timeout 60
+
+      - name: Test
+        working-directory: ${{ env.TOOL_PATH }}
+        run: uv run pytest
+
+      - name: Smoke-test entry point import
+        working-directory: ${{ env.TOOL_PATH }}
+        run: uv run python -c "import pdf_mcp.server; print('import OK')"

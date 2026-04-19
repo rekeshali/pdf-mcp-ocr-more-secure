@@ -65,6 +65,10 @@ dev = [
     # uv.lock pins to a single concrete version + hashes, so the supply-chain
     # control is not weakened.
     "numpy>=2.2.6,<3.0.0",
+    # Matplotlib is dev-only; used by the OCR integration tests to generate
+    # synthetic scan-like PDFs (rasterised text pages) for real-Tesseract
+    # round-trip verification.
+    "matplotlib>=3.8.0,<4.0",
 ]
 
 semantic = [
